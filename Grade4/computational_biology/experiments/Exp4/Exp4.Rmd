@@ -1,0 +1,242 @@
+---
+title: "Exp4: Machine Learning"
+author: "Nan He"
+date: "2025-12-16"
+output: html_document
+---
+
+## 加载必要包
+```{r}
+rm(list = ls())
+library(yulab.utils)
+pload(glmnet)
+pload(ggplot2)
+pload(caret)
+pload(pROC)
+pload(mlbench)
+pload(randomForest)
+```
+
+
+## 读取数据
+```{r}
+setwd("/Users/hinna/Desktop/nanh/grade4/计算系统生物学/exp4/")
+pqcr <- read.csv("./qPCR_data.csv")
+```
+
+
+## 数据预处理
+```{r}
+y <- pqcr$label |> as.factor()
+x <- pqcr[, 2:12] |> apply(2, as.numeric)
+feature.mean <- colMeans(x,na.rm = T)
+
+## 处理缺失值
+x[is.na(x)] <- matrix(rep(feature.mean, each = length(y)), nrow = length(y))[is.na(x)]
+
+# 进行Z-score标准化
+x <- scale(x, center = TRUE, scale = TRUE)
+```
+
+
+## 数据可视化
+```{R}
+## pca
+pca_res <- prcomp(x, center = F, scale. = F) # 已经scale过了
+pca_df <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  label = as.factor(y))
+
+var_exp <- (pca_res$sdev^2) / sum(pca_res$sdev^2)
+pc1_var <- round(var_exp[1] * 100, 1)
+pc2_var <- round(var_exp[2] * 100, 1)
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = label)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    x = paste0("PC1 (", pc1_var, "% variance)"),
+    y = paste0("PC2 (", pc2_var, "% variance)"),
+    color = "Group"
+  ) +
+  theme_bw()
+
+p_pca
+```
+
+
+## 划分数据集
+```{R}
+set.seed(42)
+train.indices <- createDataPartition(y, p = 0.8, times = 1, list = T)$Resample1
+
+x.train <- x[train.indices, ]
+x.test <- x[-train.indices, ]
+y.train <- y[train.indices]
+y.test <- y[-train.indices]
+
+table(y.train)
+table(y.test)
+```
+
+
+## 特征选择
+```{r}
+## 基于RF的特征递归消除
+rfFuncs$summary <- twoClassSummary
+
+rfectrl <- rfeControl(functions = rfFuncs,
+                      verbose = TRUE,
+                      method = "boot",
+                      number = 10)
+
+set.seed(42)
+rfe.results <- rfe(x.train, y.train, 
+               sizes = seq(2, 11), 
+               rfeControl = rfectrl,
+               metric = "ROC")
+
+plot(rfe.results) # 选择4个特征作为输入
+selected.features <- predictors(rfe.results)
+selected.features
+```
+
+
+## 模型调参
+# 基于Elastic Net正则化的逻辑回归
+```{r}
+# alpha: 0=ridge, 1=lasso, 0~1=elastic net
+alpha_grid  <- seq(0, 1, by = 0.1)
+lambda_grid <- 10^seq(-4, 1, length.out = 60) 
+
+params.grid <- expand.grid(
+  alpha  = alpha_grid,
+  lambda = lambda_grid)
+
+
+set.seed(42)
+tr.ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+x_sub <- x.train[, predictors(rfe.results), drop = FALSE]
+
+cv.fitted <- train(
+  x = x_sub,
+  y = y.train,
+  method = "glmnet",
+  metric = "ROC",
+  tuneGrid = params.grid,
+  trControl = tr.ctrl
+)
+
+cv.fitted$bestTune
+```
+
+
+## 评估逻辑回归模型
+```{r}
+y.test.pred.prob <- predict(cv.fitted,newdata = x.test,type = "prob")
+roc.curve <- roc(y.test, y.test.pred.prob[, 2])
+plot(roc.curve,print.auc=T)
+
+metrics <- c("threshold", "sensitivity", "specificity", "precision", "recall")
+
+set.seed(42)
+ci.auc(roc.curve, conf.level = 0.95)
+ci.coords(roc.curve,x="best",conf.level = 0.95,ret ="recall",best.method="youden",best.policy="random")
+```
+
+## 模型比较(XGBoost) --optional
+```{r}
+pload(xgboost)
+
+## 调参
+xgb_grid <- expand.grid(
+  nrounds = c(100, 300),
+  max_depth = c(3, 5),
+  eta = c(0.05, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.8, 1.0),
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+xgb.fitted <- train(
+  x = x_sub,
+  y = y.train,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = tr.ctrl,
+  tuneGrid = xgb_grid
+)
+
+xgb.fitted$bestTune
+
+
+## 对比两个模型的CV结果
+resamps <- resamples(list(
+  ElasticNet = cv.fitted,
+  XGBoost    = xgb.fitted
+))
+
+summary(resamps)   # 各模型 ROC 的均值/分布
+p1 <- bwplot(resamps, metric = "ROC")
+p2 <- dotplot(resamps, metric = "ROC")
+aplot::plot_list(p1, p2)
+```
+
+
+## 在test上比较
+```{r}
+prob_glmnet <- predict(cv.fitted, newdata = x.test[, predictors(rfe.results), drop=FALSE], type = "prob")[, 1]
+prob_xgb <- predict(xgb.fitted, newdata = x.test[, predictors(rfe.results), drop=FALSE], type = "prob")[, 1]
+
+roc_glmnet <- roc(response = y.test, predictor = prob_glmnet, levels = rev(levels(y.test)))
+roc_xgb    <- roc(response = y.test, predictor = prob_xgb,    levels = rev(levels(y.test)))
+
+auc_glmnet <- auc(roc_glmnet)
+auc_xgb    <- auc(roc_xgb)
+
+roc_df <- rbind(
+  data.frame(
+    FPR = 1 - roc_glmnet$specificities,
+    TPR = roc_glmnet$sensitivities,
+    Model = paste0("Elastic Net (AUC=", round(auc_glmnet,3), ")")
+  ),
+  data.frame(
+    FPR = 1 - roc_xgb$specificities,
+    TPR = roc_xgb$sensitivities,
+    Model = paste0("XGBoost (AUC=", round(auc_xgb,3), ")")
+  )
+)
+
+p3 <- ggplot(roc_df, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  theme_bw() +
+  labs(
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  )
+
+p3
+
+p4 <- aplot::plot_list(
+  aplot::plot_list(p1, p2, ncol = 2),
+  p3,
+  ncol = 1,
+  heights = c(2, 1))
+
+p4
+```
+
+
+
+

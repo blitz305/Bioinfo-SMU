@@ -1,0 +1,222 @@
+---
+title: "Exp3.Crohn's_disease_network"
+output: html_document
+date: "2025-12-09"
+Author: "Nan He"
+---
+
+目标：从Intact数据库中下载克罗恩病的人类蛋白互作网络，进行数据清洗并构建`igraph`对象，使用从头实现的MCL聚类和随机游走方法对该网络进行分析。
+
+## 加载包
+```{r}
+library(dplyr)
+library(yulab.utils)
+library(org.Hs.eg.db)
+library(igraph)
+library(TCMDATA)
+library(ggplot2)
+library(ggtangle)
+library(clusterProfiler)
+```
+
+
+## 1. 读取并预处理数据
+```{r}
+## load Crohn's disease PPI data from IntAct
+intact_data <- read.delim("/Users/hinna/Desktop/nanh/grade4/计算系统生物学/network/Crohn's_disease.txt", sep = "\t", comment.char = "#", header = F)
+
+# 1. 筛选人类互作
+human_data <- intact_data %>%
+  filter(grepl("taxid:9606", V10) & grepl("taxid:9606", V11))
+
+# 2. 清洗ID前缀
+# ("uniprotkb:P12345" -> "P12345")
+clean_id <- function(x) {
+  # sub("^.*:", "", x)
+  return(sub("^.*:", "", x))
+}
+
+human_data <- human_data %>%
+  mutate(
+    Clean_A = clean_id(V1),
+    Clean_B = clean_id(V2),
+    # "intact-miscore:0.56"
+    Score = as.numeric(yulab.utils::str_extract(V15, "[0-9]\\.[0-9]+"))
+  )
+
+# 3. ID转换
+all_ids <- unique(c(human_data$Clean_A, human_data$Clean_B))
+mapped_entrez <- mapIds(
+  org.Hs.eg.db,
+  keys = all_ids,
+  column = "ENTREZID",
+  keytype = "UNIPROT",
+  multiVals = "first")
+
+id_map_df <- data.frame(
+  Original = all_ids,
+  Entrez = mapped_entrez,
+  stringsAsFactors = FALSE)
+
+id_map_df$Final_ID <- ifelse(is.na(id_map_df$Entrez), id_map_df$Original, id_map_df$Entrez)
+
+final_network_df <- human_data %>%
+  left_join(id_map_df, by = c("Clean_A" = "Original")) %>%
+  dplyr::rename(ID_A = Final_ID) %>%
+  dplyr::select(-Entrez) %>% 
+  left_join(id_map_df, by = c("Clean_B" = "Original")) %>%
+  dplyr::rename(ID_B = Final_ID) %>%
+  dplyr::select(ID_A, ID_B, Score) %>%
+  dplyr::rename(score = Score)
+
+final_network_df <- final_network_df %>%
+  filter(ID_A != ID_B) %>% # 去除自环
+  distinct(ID_A, ID_B, .keep_all = TRUE) 
+
+head(final_network_df)
+```
+
+
+## 2. 构建克罗恩人类蛋白互作网络对象
+```{r}
+g <- graph_from_data_frame(d = final_network_df, directed = FALSE)
+print(g)
+```
+
+
+## 3. 分析PPI对象
+```{r}
+## 通过置信度筛选节点
+g <- ppi_subset(g, score_cutoff = 0.5)
+
+## 计算拓扑指标
+g <- compute_nodeinfo(g)
+```
+
+## 4. MCL聚类分析
+```{R}
+## MCL聚类
+# 通过mcl包的结果
+g <- TCMDATA::run_MCL(g, inflation = 2.5) # 12 clusters
+# 聚类打分
+g_res <- TCMDATA::Addclusterscore(g, cluster_attr = "mcl_cluster")
+print(g_res)
+
+# 通过从头实现的结果
+source("/Users/hinna/Desktop/nanh/grade4/计算系统生物学/network/MCL.R")
+g1 <- run_MCL(g, inflation = 2.5) # 15 clusters
+# 聚类打分
+g1_res <- TCMDATA::Addclusterscore(g1, cluster_attr = "MCL_cluster")
+
+## 选择得分最高的cluster1进行富集分析从而注释该社区的功能
+c1_g <- g1_res[1, ]$Full_Genes |> strsplit(",") |> unlist()
+c1_bp <- enrichGO(c1_g, ont="BP", OrgDb='org.Hs.eg.db', keyType="ENTREZID")
+p1 <- dotplot(c1_bp)
+p1
+
+## 选择cluster 1进行可视化
+subg_cluster1 <- induced_subgraph(g, vids = c1_g)
+
+p2 <- ggtangle::ggplot(subg_cluster1, layout = "kk") +
+  geom_edge(
+    colour  = "grey70",
+    alpha   = 0.75,
+    linewidth = 0.15,
+    lineend  = "round"
+  ) +
+  geom_point(
+    aes(colour = degree, size = betweenness),
+    alpha = 0.9
+  ) +
+  geom_text(
+    aes(label = name),
+    colour      = "black",    
+    size        = 3,        
+    fontface    = "bold",
+    show.legend = FALSE      
+  )+
+  scale_color_gradientn(
+    name    = "node score",
+    colours = c("#4DBBD5FF", "#FFDC91", "#E64B35FF"),
+    limits  = range(igraph::vertex_attr(subg_cluster1)$degree)
+  ) +
+  scale_size_continuous(
+    name  = "Betweenness",
+    range = c(10, 15)   
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(size = 11, face = "bold"),
+    legend.text     = element_text(size = 9),
+    plot.margin     = unit(c(0.6, 0.8, 0.6, 0.8), "cm"),
+    plot.background = element_rect(fill = "white", colour = NA),
+    text            = element_text(face = "bold"))
+
+p2
+```
+
+
+## 5. 随机游走分析
+```{R}
+## 加载KEGG_T_CELL_RECEPTOR_SIGNALING_PATHWAY基因集进行分析
+gene_set <- read.gmt("/Users/hinna/Desktop/nanh/grade4/计算系统生物学/network/c2.cp.kegg_legacy.v2025.1.Hs.entrez.gmt") %>% 
+  dplyr::filter(term == "KEGG_T_CELL_RECEPTOR_SIGNALING_PATHWAY")
+
+ppi_sets <- intersect(V(g)$name, gene_set$gene)
+
+## 随机游走分析
+source("/Users/hinna/Desktop/nanh/grade4/计算系统生物学/network/RWR.R")
+g <- run_RWR(g, seed = ppi_sets, score_name = "T_cell_receptor_score")
+res_df <- igraph::as_data_frame(g, what = "vertices")
+top_candidates <- res_df %>%
+   arrange(desc(T_cell_receptor_score)) %>%
+   filter(is_seeds_T_cell_receptor_score == FALSE) %>%
+   head(10)
+print(top_candidates)
+
+## 可视化随机游走分析结果
+p3 <- ggtangle::ggplot(g, layout = "kk") +
+  geom_edge(
+    colour  = "grey70",
+    alpha   = 0.75,
+    linewidth = 0.15,
+    lineend  = "round"
+  ) +
+  geom_point(
+    aes(colour = T_cell_receptor_score, size = betweenness),
+    alpha = 0.9
+  ) +
+  geom_text(
+    aes(label = name),
+    colour      = "black",    
+    size        = 3,        
+    fontface    = "bold",
+    show.legend = FALSE      
+  )+
+  scale_color_gradientn(
+    name    = "node score",
+    colours = c("#4DBBD5FF", "#FFDC91", "#E64B35FF"),
+    limits  = range(igraph::vertex_attr(g)$T_cell_receptor_score)
+  ) +
+  scale_size_continuous(
+    name  = "Betweenness",
+    range = c(10, 15)   
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(size = 11, face = "bold"),
+    legend.text     = element_text(size = 9),
+    plot.margin     = unit(c(0.6, 0.8, 0.6, 0.8), "cm"),
+    plot.background = element_rect(fill = "white", colour = NA),
+    text            = element_text(face = "bold"))
+
+p3
+```
+
+
+在本实验中，通过以T细胞受体信号通路为种子节点集进行带重启的随机游走分析，识别出 MTOR (Entrez ID: 26191) 为网络中排名第一的关键候选基因。结果显示，MTOR的RWR 得分高达0.086，显著优于其他候选节点，呈现出断层式的领先优势。尽管MTOR并非初始T 细胞受体通路种子集成员（is_seed = FALSE），但其在克罗恩病 PPI 网络中表现出极高的拓扑重要性，其度中心性（Degree = 7）、接近中心性（Closeness = 1.0）及特征向量中心性（Eigenvector Centrality = 1.0）均达到网络峰值。
+
+这一拓扑特征表明，MTOR 在 T 细胞信号向克罗恩病相关蛋白网络扩散的过程中，扮演着“瓶颈（Bottleneck）”或“超级枢纽”的角色。从生物学机制角度分析，MTOR 作为细胞代谢与免疫应答的核心调控因子，其通路的过度激活已知与克罗恩病中 Th17 细胞的异常分化及肠道炎症加剧密切相关。本研究算法成功将 MTOR 挖掘为首要关联节点，不仅揭示了 T 细胞受体信号可能通过 MTOR 这一“总开关”调控 CD 病理网络，同时也从计算生物学角度验证了该病理机制。
+

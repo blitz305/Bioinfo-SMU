@@ -1,0 +1,171 @@
+---
+title: "Exp1: PPI Network analysis"
+output: html_document
+date: "2025-11-24"
+Author: "Nan He, Southern Medical University, Basic Medical Sciences, Department of Bioinformatics"
+---
+
+## 1. extract PPI data
+```{r}
+library(clusterProfiler)
+library(igraph)
+
+seed.protein <- c("APP", "PSEN1", "PSEN2", "APOE", "TREM2", "CR1")
+protein.info <- read.table("./9606.protein.info.v12.0.txt", sep='\t', header=T, check.names=F, comment.char="", quote="")
+head(protein.info[,seq(2)])
+
+ppi <- read.table("./9606.protein.links.v12.0.txt", header = T, check.names = F, comment.char = "", quote = "")
+
+seed.protein2 <- protein.info[protein.info$preferred_name %in% seed.protein, 1]
+
+target.ppi <- ppi |> dplyr::filter(protein1 %in%  seed.protein2 | protein2 %in% seed.protein2) |>
+    dplyr::filter(combined_score>600)
+
+target.ppi$protein1 <- protein.info[match(target.ppi$protein1, protein.info$`#string_protein_id`), 2]
+target.ppi$protein2 <- protein.info[match(target.ppi$protein2, protein.info$`#string_protein_id`), 2]
+
+target.ppi |> write.table("./target_ppi.tsv", sep="\t", row.names=F, col.names=T, quote=F)
+```
+
+## 2. build igraph object
+```{r}
+## load ppi network
+target_ppi_g <- graph_from_data_frame(target.ppi, directed=FALSE)
+target_ppi_g |> V() |> length()
+target_ppi_g |> E() |> length()
+
+## simplify network
+g_ppi <- simplify(target_ppi_g, remove.multiple = FALSE, remove.loops = TRUE)
+
+g_ppi <- simplify(g_ppi, remove.multiple = TRUE, remove.loops = FALSE,
+                  edge.attr.comb = "max")
+```
+
+
+## 3. Network topological analysis
+```{r}
+## load TCMDATA locally
+# remotes::install_github("Hinna0818/TCMDATA)
+# library(TCMDATA)
+devtools::load_all("/Users/hinna/TCMDATA")
+
+## compute node info
+g_ppi <- compute_nodeinfo(g_ppi)
+
+## show basic metrics
+V(g_ppi)$degree |> table()
+
+## show the relationship between cci and degree and betweenness
+library(tidygraph)
+library(tibble)
+library(ggfun)
+library(ggplot2)
+library(ggrepel)
+library(ggiraph)
+
+g_ppi |> as_tbl_graph() |>
+  activate('nodes') |>
+  tibble::as_tibble() |>
+  ggplot(aes(x = degree, y = clustering_coef, size = betweenness)) +
+   geom_point() +
+   geom_text_repel(data = td_filter(degree > 80), mapping = aes(label = name)) ## It is a zero-scale network
+```
+
+
+### show the PPI network
+```{r}
+library(ggtangle)
+library(ggiraph)
+library(ggraph)
+p1 <- ggtangle::ggplot(g_ppi, layout = "kk") +
+  geom_edge(alpha = 0.4) +
+  geom_text_repel(data = td_filter(degree > 60), aes(label = name), size = 3, segment.color = NA, colour = "red2", fontface = "bold") +
+  geom_point(aes(color = degree, size = betweenness)) + 
+  scale_color_viridis_c() 
+
+p1
+
+p11 <- ggraph(g_ppi, layout = 'kk') +
+ geom_edge_link() +
+ geom_point_interactive(
+   mapping = aes(
+     x = x, y = y, 
+     color = betweenness, 
+     tooltip = name,
+     data_id = name
+     )
+ ) +
+ geom_text_repel(data = td_filter(degree > 60),
+   mapping = aes(x = x, y = y, label = name), bg.color ='white'
+ ) +
+ scale_color_viridis_c() +
+ theme_graph()
+
+girafe(ggobj = p11)
+```
+
+## 4. Network community analysis
+```{r}
+## louvain clustering
+set.seed(42)
+g_ppi <- run_louvain(g_ppi)
+
+p2 <- ggtangle::ggplot(g_ppi, layout = "kk") +
+  geom_edge(alpha = 0.4) +
+  geom_point(aes(color = as.factor(louvain_cluster), size = betweenness)) +
+  geom_text_repel(data = td_filter(degree > 60), aes(label = name), size = 3, segment.color = NA, colour = "red2", fontface = "bold") +
+  scale_color_viridis_d() +
+  labs(color = "Cluster")
+p2
+```
+
+### Feature selection
+```{r}
+topnodes_info <- rank_ppi_nodes(g = g_ppi)
+g_ppi <- topnodes_info[["graph"]]
+topnodes <- topnodes_info[["table"]]
+
+## radar plot
+node_profile <- get_node_profile(topnodes, node_name = "APOE",
+                                 metrics = c("degree", 
+                                         "betweenness", 
+                                         "closeness",
+                                         "MCC", 
+                                         "MNC", 
+                                         "pagerank", 
+                                         "coreness", 
+                                         "EPC"))
+p_radar <- radar_plot(node_profile, title = "Centrality score of APOE")
+p_radar
+```
+
+
+## 5. Network functional modules analysis
+```{r}
+library(enrichplot)
+library(org.Hs.eg.db)
+
+module.genes <- g_ppi |> as_tbl_graph() |> activate('nodes') |>tibble::as_tibble()
+
+module.ora.res <- compareCluster(name ~ louvain_cluster, data = module.genes, fun = enrichGO, keyType = "SYMBOL", OrgDb=org.Hs.eg.db, ont = "BP")
+
+dotplot(module.ora.res, label_format = 70)
+```
+
+### choose cluster 1 for further functional enrichment analysis
+```{r}
+# select cluster 1 nodes
+c1_nodes <- V(g_ppi)$name[V(g_ppi)$louvain_cluster == "1"]
+subg_cluster1 <- induced_subgraph(g_ppi, vids = c1_nodes)
+
+# cluster 1 enrichment analysis
+c1 <- enrichGO(c1_nodes, OrgDb='org.Hs.eg.db', keyType="SYMBOL", ont = "all")
+c1go <- gglollipop(c1, line.col = "orange", split = "ONTOLOGY",
+                   line.type = "dashed", palette = "PiYG", top_n = 5, show_count = F) + 
+  facet_grid(ONTOLOGY ~ ., scales = "free_y") +
+  theme(strip.text.y = element_text(angle = 0)) 
+c1go
+```
+
+
+

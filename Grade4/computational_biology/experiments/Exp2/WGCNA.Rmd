@@ -1,0 +1,429 @@
+---
+title: 'Exp2: WGCNA'
+output: html_document
+date: "2025-11-27"
+Author: "Nan He, Southern Medical University, Basic Medical Sciences"
+---
+## load pkgs
+```{R}
+rm(list = ls())
+library(yulab.utils)
+pload("WGCNA")
+pload("flashClust")
+pload("ggplot2")
+pload("aplot")
+pload("ggtree")
+pload("ggfun")
+pload("tibble")
+pload("tidyr")
+pload("ggfittext")
+pload("igraph")
+pload("ggiraph")
+pload("enrichplot")
+```
+
+## load data
+```{r}
+# 基因表达丰度表
+expr <- readRDS("./input_fpkm_matrix.rds")
+
+# 样本的相关信息表
+trait <- readRDS("./data_traits.rds")
+```
+
+
+## select soft-value
+```{r}
+enableWGCNAThreads()
+
+# 软阈值
+powers = c(seq(10), seq(from=12, to=20, by=2))
+powers
+
+sft <- pickSoftThreshold(expr, powerVector = powers, verbose = 5)
+sft
+
+p1 <- sft$fitIndices |>
+ ggplot(mapping = aes(x=Power, y = -sign(slope) * SFT.R.sq)) +
+   geom_text(mapping = aes(label = Power), color = "red") +
+   geom_hline(yintercept = 0.9, color = 'blue') +
+   labs(
+     x = "Soft Threshold (power)",
+     y = "Scale Free Topology Model Fit,signed R^2",
+     title = "Scale independence"
+     )
+
+p2 <- sft$fitIndices |>
+ ggplot(mapping = aes(x= Power, y = mean.k.)) +
+   geom_text(mapping = aes(label = Power), color = "red") +
+   labs(x="Soft Threshold (power)",
+        y="Mean Connectivity",
+    title = "Mean connectivity")
+
+plot_list(p1, p2)
+```
+
+## network construction and module identification
+```{r}
+net <- blockwiseModules(expr,
+                 power = sft$powerEstimate,
+                 maxBlockSize = 6000,
+                 TOMType = "unsigned", minModuleSize = 30,
+                 reassignThreshold = 0, mergeCutHeight = 0.25,
+                 numericLabels = TRUE, pamRespectsDendro = FALSE,
+                 saveTOMs = TRUE,
+                 saveTOMFileBase = "FPKM-TOM",
+                 verbose = 3)
+
+names(net)
+table(net$colors)
+``` 
+
+## module visualization
+```{r}
+plot_wgcna <- function(x, linewidth = .05){
+  colors <- x$colors
+  labels2colors <- yulab.utils::get_fun_from_pkg(fun="labels2colors", pkg="WGCNA")
+  if(is.numeric(colors)) {
+    colors <- labels2colors(colors)
+  }      
+
+  d <- data.frame(label = seq(length(x$colors)), Module=as.character(colors)[x$blockGenes[[1]]])
+
+  p <- ggtree(x$dendrograms[[1]], layout = "dendrogram", ladderize = FALSE, linewidth= linewidth) +
+       ggfun::theme_noxaxis() +
+       labs(x = "Height")
+
+  p2 <- ggplot(data = d, aes(x=label, y = "Module", fill = I(Module))) + 
+        geom_tile() +
+    labs(x=NULL, y=NULL) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  
+  p2 |> insert_top(p, height=10)
+}
+
+plot_wgcna(net)
+
+
+```
+
+
+## eigengenes analysis
+```{r}
+# 计算模块特征基因
+moduleColors <- labels2colors(net$colors)
+MEs <- moduleEigengenes(expr, moduleColors)$eigengenes
+
+# 排序  
+MET <- orderMEs(MEs)
+```
+
+
+## module correlation visualization
+```{r}
+plot_eignet <- function(x, fontsize=3.88, linewidth = .5, label_expand = .01, showheatmap = FALSE){
+   res <- as.dist(1 - cor(x)) |> hclust(method = 'average')
+   p <- ggtree(res, layout = "dendrogram", ladderize = FALSE, linewidth= linewidth) +
+        geom_tiplab(size = fontsize) +
+        ggfun::theme_noxaxis() +
+        labs(x = "Height") +
+    expand_limits(x = label_expand)
+   if (showheatmap){ 
+     dat <- (1 + cor(x)) * .5
+     lab.order <- get_taxa_name(p)
+     f <- dat |> tibble::as_tibble(rownames = 'id') |> 
+       tidyr::pivot_longer(cols = !id) |>
+       dplyr::mutate(name = factor(name, levels = lab.order)) |>
+       ggplot(aes(x=id, y=name, color = value, size=value)) +
+       geom_point() +
+       scale_color_gradient2(
+         low = "deepskyblue", 
+         mid = 'white', 
+         high= "orangered", 
+         midpoint = .5) +
+       labs(x=NULL, y = NULL) +
+       theme_bw() +
+       theme(axis.text = element_blank(), 
+             axis.ticks = element_blank(),
+             panel.grid = element_blank(),
+             panel.border = element_blank()
+       )
+     df <- data.frame(label = colnames(x), module = gsub("ME", "", colnames(x))) 
+     f2 <- df |> 
+           ggplot(aes(x = label, y="module", fill =I(module))) +
+            geom_tile() +
+            labs(x=NULL, y = NULL) +
+            theme_bw() +
+            theme(axis.text.y = element_blank(),
+              axis.text.x = element_text(angle = -45, vjust=1, hjust=0),
+          axis.ticks.y = element_blank(),
+                  panel.grid = element_blank(),
+                  panel.border = element_blank()
+            ) 
+     f3 <- f2 + coord_flip() +
+       theme(
+             axis.text.x = element_blank(),
+         axis.ticks = element_blank(),
+         panel.grid = element_blank(),
+             panel.border = element_blank()
+       )
+     p$layers$label_geom = NULL
+     p <- f |> insert_bottom(f2, height = .1) |>
+          insert_right(f3, width = .08) |>
+      insert_top(p, height = .4)
+   }
+   return(p)
+}
+
+plot_eignet(MET)
+plot_eignet(MET, showheatmap = T)
+
+```
+
+
+## visualize the correlation between module and phenotype
+```{r}
+design <- model.matrix(~0+ trait$subtype)
+colnames(design) <- levels(trait$subtype)
+moduleColors <- labels2colors(net$colors)
+nGenes <- ncol(expr)
+nSamples <- nrow(expr)
+
+# Recalculate MEs with color labels
+MEs0 <- moduleEigengenes(expr, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+moduleTraitCor <- cor(MEs, design, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+## visu
+plot_module_trait <- function(x, y){
+  df <- 1 - x
+  module.dendro <- df |> 
+    dist() |> 
+    hclust(method = 'average') 
+  trait.dendro <- df |> t() |>
+    dist() |>
+    hclust(method = 'average')
+
+  x <- x |> 
+    as.data.frame(check.names=FALSE) |> 
+    tibble::rownames_to_column(var='module') |> 
+    tidyr::pivot_longer(cols=!module, values_to='cor')  
+  y <- y |> as.data.frame(check.names = FALSE) |>
+    tibble::rownames_to_column(var = 'module') |>
+    tidyr::pivot_longer(cols = !module , values_to = 'pval')
+  
+  dat <- x |> 
+         dplyr::left_join(y) |>
+         dplyr::mutate(label = paste0(signif(cor, 2), "\n(", signif(pval, 1), ")"), 
+                   module = factor(module, rev(module.dendro$labels)),
+               name = factor(name, trait.dendro$labels)
+               )
+  
+  p <-  dat |> 
+        ggplot(aes(x = name, y = module, fill = cor)) +
+        geom_tile() +
+        geom_fit_text(mapping = aes(label = label)) +
+        scale_fill_gradient2(
+          low = "deepskyblue",
+          mid = 'white',
+          high= "orangered",
+          midpoint = 0
+        ) +
+        labs(x=NULL, y = NULL) +
+    theme_bw() +
+        theme(
+         axis.text.x = element_text(angle = -45, vjust = 1, hjust = 0),
+             panel.grid = element_blank(),
+             panel.border = element_blank()
+        )
+
+  p2 <- dat |> dplyr::select(module) |> dplyr::distinct() |>
+     ggplot(aes(x = 'module', y = module, fill = I(gsub("ME", "",module)))) +
+     geom_tile() +
+     labs(x=NULL, y=NULL) +
+     theme_bw() +
+     theme(
+       axis.text = element_blank(),
+       axis.ticks = element_blank(),
+       panel.grid = element_blank(),
+       panel.border = element_blank()
+     )
+  p <- p |> insert_right(p2, width = .05)
+  return(p)
+
+}
+
+plot_module_trait(moduleTraitCor, moduleTraitPvalue)
+```
+
+
+## gene module analysis
+```{r}
+connet <- abs(cor(expr, use="p"))^6
+Alldegrees1 <- intramodularConnectivity(connet, moduleColors)
+
+# Relationship between gene significance and intramodular connectivity
+which.module <- "darkred"
+Claudin_low <- as.data.frame(design[, 2])
+names(Claudin_low) <- "Claudin-low"
+GS1 <- as.numeric(cor(expr, Claudin_low, use = "p"))
+GeneSignificance <- abs(GS1)
+
+
+# Generalizing intramodular connectivity for all genes on the array
+datKME <- signedKME(expr, MEs, outputColumnName="MM.")
+
+# Display the first few rows of the data frame
+head(datKME)
+
+# filter
+FilterGenes <- abs(GS1)>0.8 & abs(datKME$MM.brown)>0.8
+table(FilterGenes)
+
+hubgenes <- rownames(datKME)[FilterGenes]
+hubgenes
+
+Alldegrees1[hubgenes, ]
+
+TOM <- TOMsimilarityFromExpr(expr, power = 6) 
+
+# Select module
+module <- "darkred"
+# Select module probes
+probes <- colnames(expr)
+inModule <- (moduleColors==module)
+modProbes <- probes[inModule] 
+# Select the corresponding Topological Overlap
+modTOM <- TOM[inModule, inModule]
+dimnames(modTOM) <- list(modProbes, modProbes)
+modTOM[seq(4), seq(4)]
+
+IMConn <- softConnectivity(expr[, modProbes])
+
+# 选择连接度排名前40的
+nTop <- 40
+target.genes <- rownames(modTOM)[(length(IMConn) - rank(IMConn)) <= nTop]
+
+target.modTOM <- modTOM[target.genes, target.genes]
+
+target.g <- graph_from_adjacency_matrix(
+               target.modTOM,
+           mode = 'undirected',
+           weighted = TRUE,
+           diag = FALSE
+)
+
+target.g.sim <- target.g |> igraph::simplify()
+
+## add network metrics
+target.g.sim <- TCMDATA::compute_nodeinfo(target.g.sim)
+```
+
+
+## network visu
+```{r}
+library(ggraph)
+p7 <- ggraph(target.g.sim, layout = 'fr') +
+  geom_segment_interactive(
+      data = get_edges("short"), 
+      mapping = aes(x=x, y=y, xend=xend, yend=yend, group = edge.id),
+      linewidth = .1,
+      color = "grey" 
+  ) +
+  geom_point_interactive(
+      mapping = aes(x = x, 
+                    y = y, 
+                    tooltip = name, 
+                    data_id = name,
+                    color = closeness), 
+      size = 6
+  ) +
+  scale_color_viridis_c(option = "C") + 
+  theme_graph() 
+
+
+girafe(ggobj = p7)
+```
+
+
+## ORA enrichment analysis
+```{r}
+pload("clusterProfiler")
+pload("org.Hs.eg.db")
+pload("TCMDATA")
+darkred.genes <- colnames(expr)[moduleColors == 'darkred']
+
+# conver gene type
+gene_convert <- bitr(darkred.genes, 
+                     fromType = "ENSEMBL", 
+                     toType = c("ENTREZID", "SYMBOL"), 
+                     OrgDb = org.Hs.eg.db)
+gene_list <- gene_convert$ENTREZID
+
+# GO
+ego_bp <- enrichGO(gene = gene_list, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", readable = T)
+
+p_bp1 <- gglollipop(ego_bp, show_count = T)
+p_bp1
+
+# comparecluster for GO
+target_modules <- c("brown", "blue", "turquoise", "darkred")
+
+gene_df <- data.frame(GeneID = colnames(expr), Module = moduleColors) %>%
+  filter(Module %in% target_modules)
+
+ids <- bitr(gene_df$GeneID, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+merged_df <- dplyr::inner_join(gene_df, ids, by = c("GeneID" = "ENSEMBL"))
+
+ck_go <- compareCluster(ENTREZID ~ Module, data = merged_df, fun = "enrichGO",
+                        OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH",
+                        pvalueCutoff = 0.05, readable = TRUE)
+
+dotplot(ck_go, showCategory = 5) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## GSEA for darkred gene list
+```{r}
+gene_kME <- signedKME(expr, MEs, outputColumnName="MM.")
+rank_metric <- gene_kME$MM.darkred   
+names(rank_metric) <- rownames(gene_kME) 
+
+gene_df <- data.frame(
+  ENSEMBL = names(rank_metric),
+  kME = rank_metric)
+
+ids <- bitr(gene_df$ENSEMBL, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+merged_df <- merge(gene_df, ids, by = "ENSEMBL")
+
+merged_df <- merged_df %>% 
+  group_by(ENTREZID) %>% 
+  filter(abs(kME) == max(abs(kME))) %>% 
+  dplyr::ungroup()
+
+geneList <- merged_df$kME
+names(geneList) <- merged_df$ENTREZID
+geneList <- sort(geneList, decreasing = TRUE)
+
+# run gsea
+set.seed(42)
+gsea_kegg <- gseKEGG(geneList     = geneList,
+                     organism     = 'hsa',
+                     minGSSize    = 10,
+                     maxGSSize    = 500, 
+                     pvalueCutoff = 0.05,
+                     verbose      = FALSE)
+
+gsea_kegg <- setReadable(gsea_kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+head(gsea_kegg)
+
+## visu no.1
+pathway_id1 <- gsea_kegg$ID[1] 
+gseaplot2(gsea_kegg, geneSetID = pathway_id1, title = gsea_kegg$Description[1])
+```
